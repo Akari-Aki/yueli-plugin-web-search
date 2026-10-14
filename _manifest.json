@@ -3,7 +3,7 @@
   "id": "yueli.web-search",
   "plugin_type": "tool",
   "name": "联网搜索",
-  "version": "0.1.0",
-  "description": "按部署者配置的 HTTP JSON 接口搜索公开信息，结果作为外部观察回灌",
-  "host_application": { "min_version": "0.1.5" }
+  "version": "0.2.0",
+  "description": "按部署者配置的 HTTP JSON 接口或宿主 MCP 工具搜索公开信息，结果作为外部观察回灌",
+  "host_application": { "min_version": "0.2.0", "max_version": "0.2.0" }
 }

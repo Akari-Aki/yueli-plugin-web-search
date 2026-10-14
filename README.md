@@ -2,17 +2,17 @@
 
 这是 YueLiBot 的独立外部工具插件。她可以在对方要求查资料，或回答依赖近期、尚不确定的公开事实时调用 `web_search`，取得网页标题、来源、日期和摘要。闲聊、群友私事与已知常识不需要搜索。结果只作为外部观察交给决策与回复生成，不直接发送消息，也不读取结果里的链接。
 
-插件不预设搜索服务，支持部署者配置的 GET 或 POST HTTP JSON 接口。查询词会发给你配置的搜索服务，请勿把私人信息写入查询词。
+插件不预设搜索服务，支持部署者配置的 GET 或 POST HTTP JSON 接口，也可经宿主调用已列入配置的只读 MCP 工具。查询词会发给你配置的搜索服务，请勿把私人信息写入查询词。
 
 ## 安装与更新
 
 在主程序根目录执行 `git clone <仓库地址> plugins/web-search`，然后重启主程序。仓库根目录就是插件目录。更新时进入插件目录执行 `git pull`，再重启生效。
 
-主程序 0.1.5 可以运行插件；建议使用 0.1.6 及以上版本，搜索结果才能完整交到回复生成。
+本版插件要求主程序 0.2.0，清单声明支持区间为 0.2.0～0.2.0；0.2.x 的后续补丁由宿主按兼容模式加载。旧版主程序应继续使用旧版插件。
 
 ## 配置
 
-第一次启动后，宿主会在插件目录生成 `config.toml`，只有 `[plugin]` 一段。接口地址留空时不启用搜索。以下示例的用法是**整段替换生成文件中的同名行**，保留 `[plugin]`、`enabled` 和 `daily_limit`。内联表必须写在一行里，不能拆成多行。
+第一次启动后，宿主会在插件目录生成 `config.toml`，只有 `[plugin]` 一段。`transport` 默认为 `http`，沿用原有 HTTP 行为，此时接口地址留空不启用搜索。以下示例的用法是**整段替换生成文件中的同名行**，保留 `[plugin]`、`enabled` 和 `daily_limit`。内联表必须写在一行里，不能拆成多行。密钥字段在宿主 WebUI 中隐藏，留空保存会保留原值。
 
 密钥只填写在 `api_key`，其他位置用 `{api_key}` 引用；这样响应或错误回显密钥时插件才能将它抹除。不要把密钥写死在请求头或请求体模板里。
 
@@ -120,11 +120,49 @@ fields = { title = "title", snippet = "content", url = "url", date = "publishedD
 
 查看接口文档，依次找到请求地址与方法、鉴权放在请求头还是查询参数、请求中的查询词位置、响应结果数组的位置及每条结果的字段。然后填写 `url`、`method`、`api_key`、`headers`、`params`、`body`、`results_path` 和 `fields`。GET 的 `body` 必须为空；使用 `{api_key}` 时密钥不能为空。
 
-不支持需要计算请求签名的接口，也不支持 HTML、XML、纯文本响应或 MCP 形式的搜索服务。不自动跟随重定向；接口发生跳转时应修改配置地址，避免鉴权头被带往其他主机。
+HTTP 方式不支持需要计算请求签名的接口，也不支持 HTML、XML、纯文本响应。不自动跟随重定向；接口发生跳转时应修改配置地址，避免鉴权头被带往其他主机。
+
+## 经 MCP 接入（以百炼联网搜索增强版为例）
+
+先在宿主 `config/mcp.toml` 中登记服务与原始工具。厂商名 `dashscope` 应与 `providers.toml` 的实际名称一致，宿主负责鉴权、连接、只读校验和调用次数管理。
+
+```toml
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+name = "bailian"
+enabled = true
+transport = "http"
+url = "https://dashscope.aliyuncs.com/api/v1/mcps/EnhancedSearch/mcp"
+api_key_provider = "dashscope"
+headers = { Authorization = "Bearer {api_key}" }
+
+[mcp.servers.tools.search_pro]
+expose = false
+readonly = true
+daily_limit = 3
+```
+
+`search_pro` 没有只读标注，需要由部署者确认 `readonly = true`。`expose = false` 让它仅供插件调用，避免与整理后的 `web_search` 同时出现在她的工具列表中。然后替换插件配置中的同名行：
+
+```toml
+transport = "mcp"
+mcp_server = "bailian"
+mcp_tool = "search_pro"
+arguments = { query = "{query}" }
+results_path = "pages"
+fields = { title = "title", snippet = "snippet", url = "url", site = "hostname" }
+daily_limit = 3
+```
+
+MCP 方式不检查或使用 `url`、`method`、`headers`、`params`、`body` 等 HTTP 字段。`arguments` 的占位符展开规则与 `body` 相同。结果有结构化内容时优先使用，否则将文本结果解析为 JSON，再按相同的 `results_path` 与 `fields` 整理，观察格式与 HTTP 方式一致。
+
+服务未连上、工具未列入配置、未确认只读或达到宿主日上限时，返回「联网搜索失败：<中文原因>」；工具报错保留文本前 200 字，非 JSON 返回响应开头，不把错误当成空搜索结果。插件自己的上限仍生效，两道上限取更紧的一道。修改宿主和插件配置后均需重启主程序。
 
 ## 日上限与缓存
 
-`daily_limit` 默认 50，可填 1～1000。按服务器本地日期统计每次发出的 HTTP 请求，失败也计数；达到上限后工具当天不再出现。计数仅保存在进程内，跨日清零，重启也清零。
+`daily_limit` 默认 50，可填 1～1000。按服务器本地日期统计每次发出的搜索请求，失败也计数；达到上限后工具当天不再出现。计数仅保存在进程内，跨日清零，重启也清零。
 
 同一个查询词在 10 分钟内复用成功结果，包括空结果，不发请求、不计数。查询词比较会忽略大小写、首尾空白与连续空白差异；缓存最多 64 条，最旧记录先淘汰，失败不缓存。HTTP 总时限为 8 秒。
 
@@ -138,6 +176,6 @@ fields = { title = "title", snippet = "content", url = "url", date = "publishedD
 
 ## 离线测试与许可证
 
-设置 `YUELI_ROOT` 为主程序源码根目录，使用宿主虚拟环境的 Python 运行 `python -m pytest tests`。运行测试时请明确设置该环境变量。测试只使用 `httpx.MockTransport`，不调用真实接口或模型；插件不另行声明运行依赖。
+设置 `YUELI_ROOT` 为主程序源码根目录，使用宿主虚拟环境的 Python 运行 `python -m pytest tests`。运行测试时请明确设置该环境变量。HTTP 测试使用 `httpx.MockTransport`，MCP 测试使用 `ctx.mcp` 桩件，不调用真实接口或模型；插件不另行声明运行依赖。旧宿主缺少 `ctx.mcp` 时仅跳过 MCP 用例，HTTP 用例照常运行；用例临时把宿主版本替换为清单要求的 0.2.0，以验证宿主尚未发版时的代码。
 
 许可证为 AGPL-3.0，见 LICENSE。

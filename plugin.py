@@ -1,4 +1,4 @@
-"""通过部署者配置的 HTTP JSON 接口搜索公开信息的外部工具插件。
+"""通过部署者配置的 HTTP JSON 接口或宿主 MCP 工具搜索公开信息的插件。
 
 配置与工具声明只依赖 src.plugin_system 门面；请求展开和字段映射交给 request.py。
 本模块负责可见性、日计数、成功缓存、观察渲染及全部对外文本的密钥抹除。
@@ -6,18 +6,18 @@
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from pydantic import Field
 from time import monotonic
 from typing import Any, Dict, FrozenSet, List, Literal, Optional, Union, cast
 from urllib.parse import urlsplit
-
-import re
+from pydantic import Field
 
 import httpx
+import json
+import re
 
 from src.plugin_system import PluginConfig, PluginManifest, ToolContext, ToolExecutionResult, ToolInvocation, ToolPlugin, tool
 
-from .request import MAX_RESULTS, SearchRequestError, redact_text, search_request, uses_api_key
+from .request import MAX_RESULTS, RESPONSE_PREVIEW_CHARS, SearchRequestError, SearchResponse, expand_values, map_results, redact_text, search_request, uses_api_key
 
 # 查询词去首尾空白后的最大字符数，允许范围为 1 到此值。
 MAX_QUERY_CHARS = 60
@@ -48,15 +48,19 @@ def today() -> date:
 class WebSearchConfig(PluginConfig):
     """声明宿主自动生成的插件配置；完整性检查在加载钩子中进行。"""
 
+    transport: Literal['http', 'mcp'] = Field(default='http', description='接法：http 为原有 HTTP JSON 接口，mcp 为宿主列入配置的只读 MCP 工具')
+    mcp_server: str = Field(default='', description='宿主 mcp.toml 中的服务名称；仅 mcp 接法使用')
+    mcp_tool: str = Field(default='', description='MCP 服务的原始工具名；仅 mcp 接法使用，不填写模型别名')
+    arguments: Dict[str, Any] = Field(default_factory=dict, description='MCP 参数内联表；占位符规则与 body 相同，支持 {query}、{count}、{api_key}')
     url: str = Field(default='', description='HTTP JSON 搜索接口地址；留空表示未配置，工具不会出现在可选项里')
     method: Literal['GET', 'POST'] = Field(default='POST', description='HTTP 请求方法，只支持 GET 或 POST；GET 时 body 必须为空')
-    api_key: str = Field(default='', description='接口密钥；只在这里填写，其他位置用 {api_key} 引用；不需要密钥时留空')
+    api_key: str = Field(default='', description='接口密钥；只在这里填写，其他位置用 {api_key} 引用；不需要密钥时留空', json_schema_extra={'secret': True})
     headers: Dict[str, str] = Field(default_factory=dict, description='请求头内联表；字符串值支持 {query}、{count}、{api_key}，必须写在一行里')
     params: Dict[str, Any] = Field(default_factory=dict, description='URL 查询参数内联表；嵌套字符串值支持 {query}、{count}、{api_key}，必须写在一行里')
     body: Dict[str, Any] = Field(default_factory=dict, description='POST JSON 体内联表；嵌套字符串值支持 {query}、{count}、{api_key}，必须写在一行里；GET 时为空')
     results_path: str = Field(default='', description='响应中结果数组的非空点号路径，仅支持字典键，不支持数组下标')
     fields: Dict[str, Union[str, List[str]]] = Field(default_factory=dict, description='title、snippet、url、site、date 的字段路径或候选路径数组；至少映射 title 或 snippet，内联表写在一行里')
-    daily_limit: int = Field(default=50, ge=1, le=1000, description='服务器本地日期内最多发出的 HTTP 请求数，1～1000，失败也计数；缓存命中不计数，重启清零')
+    daily_limit: int = Field(default=50, ge=1, le=1000, description='服务器本地日期内最多发出的搜索请求数，1～1000，失败也计数；缓存命中不计数，重启清零；MCP 还受宿主工具上限约束')
 
 
 @dataclass(frozen=True)
@@ -130,7 +134,7 @@ class WebSearchPlugin(ToolPlugin):
         return frozenset({'web_search'}) if self._available and self._requests_today < config.daily_limit else frozenset()
 
     def _count_request(self) -> None:
-        """在 HTTP 发出之前同步检查并计数，失败也占用额度，缓存命中不调用。
+        """在 HTTP 或 MCP 调用之前同步检查并计数，失败也占用额度，缓存命中不调用。
 
         检查与递增之间不能 await；多个会话并发时，若在检查后让出执行权，可能
         同时占用最后一个额度。同步回调保证发请求之前暴露达限，不突破日上限。
@@ -170,7 +174,7 @@ class WebSearchPlugin(ToolPlugin):
         :param context: 宿主工具上下文；不读取聊天记录，不扩展其他插件的链接表。
         :return: 成功观察或以「联网搜索失败」开头的失败结果，所有文本抹除密钥。
         :raises asyncio.CancelledError: 取消保持宿主语义，不收口为普通失败。
-        副作用：缓存未命中时发出一次 HTTP 请求并占用一个日额度。
+        副作用：缓存未命中时发出一次搜索请求并占用一个日额度。
         """
         config = cast(WebSearchConfig, self.config)
         try:
@@ -184,11 +188,14 @@ class WebSearchPlugin(ToolPlugin):
             cached = self._cache.get(key)
             if cached is not None:
                 return replace(cached.result, metadata={**cached.result.metadata, 'cached': True})
-            response = await search_request(
-                url=config.url, method=config.method, api_key=config.api_key, headers=config.headers,
-                params=config.params, body=config.body, results_path=config.results_path, fields=config.fields,
-                query=query, proxy=self.ctx.host.https_proxy, on_request=self._count_request, transport=self._transport,
-            )
+            if config.transport == 'mcp':
+                response = await self._mcp_request(config, query)
+            else:
+                response = await search_request(
+                    url=config.url, method=config.method, api_key=config.api_key, headers=config.headers,
+                    params=config.params, body=config.body, results_path=config.results_path, fields=config.fields,
+                    query=query, proxy=self.ctx.host.https_proxy, on_request=self._count_request, transport=self._transport,
+                )
             result = ToolExecutionResult(
                 tool_name=invocation.tool_name, success=True,
                 observation=redact_text(_render_observation(query, response.items), config.api_key),
@@ -213,6 +220,31 @@ class WebSearchPlugin(ToolPlugin):
                 self.ctx.logger.warning('联网搜索鉴权失败', status_code=status, host=self._endpoint_host)
             return ToolExecutionResult(tool_name=invocation.tool_name, success=False, error_message=message, metadata=metadata)
 
+    async def _mcp_request(self, config: WebSearchConfig, query: str) -> SearchResponse:
+        """只经插件门面调用宿主；优先取结构化结果，否则严格解析文本 JSON。
+
+        新入口类型延迟导入，使旧宿主离线验证 HTTP 方式时不因缺少 MCP 类型而失败。
+        工具报错、不可用及非 JSON 都保留中文失败原因，不转成空搜索结果。
+        """
+        from src.plugin_system import McpUnavailableError
+        arguments = expand_values(config.arguments, query=query, api_key=config.api_key)
+        self._count_request()
+        try:
+            result = await self.ctx.mcp.call_tool(config.mcp_server, config.mcp_tool, arguments)
+        except McpUnavailableError as exc:
+            raise SearchRequestError(str(exc)) from exc
+        if result.is_error:
+            raise SearchRequestError(redact_text(result.text, config.api_key)[:RESPONSE_PREVIEW_CHARS])
+        preview = ' '.join(redact_text(result.text, config.api_key).split())[:RESPONSE_PREVIEW_CHARS]
+        if result.structured is not None:
+            document = result.structured
+        else:
+            try:
+                document = json.loads(result.text)
+            except ValueError as exc:
+                raise SearchRequestError(f'返回内容不是 JSON；响应开头：{preview}') from exc
+        return map_results(document, results_path=config.results_path, fields=config.fields, preview=preview)
+
 
 def _configuration_reason(config: WebSearchConfig) -> str:
     """在宿主逐字段校验后检查请求与映射的完整性。
@@ -220,14 +252,17 @@ def _configuration_reason(config: WebSearchConfig) -> str:
     :param config: 已绑定的配置模型，不修改字段、不执行网络请求。
     :return: 首个明确的中文不可用原因；空串表示配置完整。
     """
-    if not config.url.strip():
-        return '联网搜索未配置，不会出现在可选工具里'
-    try:
-        valid_url = config.url.startswith(('http://', 'https://')) and bool(urlsplit(config.url).hostname)
-    except ValueError:
-        valid_url = False
-    if not valid_url:
-        return '联网搜索配置不完整：url 必须是 http:// 或 https:// 开头的完整地址'
+    if config.transport == 'http':
+        if not config.url.strip():
+            return '联网搜索未配置，不会出现在可选工具里'
+        try:
+            valid_url = config.url.startswith(('http://', 'https://')) and bool(urlsplit(config.url).hostname)
+        except ValueError:
+            valid_url = False
+        if not valid_url:
+            return '联网搜索配置不完整：url 必须是 http:// 或 https:// 开头的完整地址'
+    elif not config.mcp_server.strip() or not config.mcp_tool.strip():
+        return '联网搜索配置不完整：mcp_server 与 mcp_tool 均必填'
     extra = set(config.fields) - FIELD_NAMES
     if extra:
         return '联网搜索配置不完整：fields 含未知字段 ' + '、'.join(sorted(extra))
@@ -235,9 +270,10 @@ def _configuration_reason(config: WebSearchConfig) -> str:
         return '联网搜索配置不完整：fields 至少映射 title 或 snippet'
     if not config.results_path.strip():
         return '联网搜索配置不完整：缺少 results_path'
-    if config.method == 'GET' and config.body:
+    if config.transport == 'http' and config.method == 'GET' and config.body:
         return '联网搜索配置不完整：GET 时 body 必须为空'
-    if not config.api_key and any(uses_api_key(value) for value in (config.headers, config.params, config.body)):
+    templates = (config.headers, config.params, config.body) if config.transport == 'http' else (config.arguments,)
+    if not config.api_key and any(uses_api_key(value) for value in templates):
         return '联网搜索配置不完整：引用了 {api_key}，但 api_key 为空'
     return ''
 
@@ -249,6 +285,8 @@ def _host(config: WebSearchConfig) -> str:
     :return: 抹除密钥的主机名，不含路径、查询参数或鉴权头。
     :raises ValueError: 地址结构非法；加载时明确报告配置错误。
     """
+    if config.transport == 'mcp':
+        return redact_text(config.mcp_server + '.' + config.mcp_tool, config.api_key)
     hostname = urlsplit(config.url).hostname
     return redact_text(hostname if hostname is not None else '', config.api_key)
 

@@ -29,7 +29,7 @@ class SearchResponse:
     """保存清洗后的结果字段与 HTTP 状态，不保留原始响应和鉴权信息。"""
 
     items: List[Dict[str, str]]
-    status_code: int
+    status_code: Optional[int]
 
 
 class SearchRequestError(ValueError):
@@ -138,6 +138,18 @@ def _response_preview(response: httpx.Response, api_key: str) -> str:
     return ' '.join(redact_text(response.text, api_key).split())[:RESPONSE_PREVIEW_CHARS]
 
 
+def map_results(document: Any, *, results_path: str, fields: Dict[str, Union[str, List[str]]],
+                preview: str, status_code: Optional[int] = None) -> SearchResponse:
+    """HTTP 与 MCP 共用同一路径提取和清洗，不解释服务商字段、不伪造空结果。"""
+    rows = value_at_path(document, results_path)
+    if not isinstance(rows, list):
+        raise SearchRequestError(f'返回内容里找不到结果列表 {results_path}；响应开头：{preview}', status_code)
+    return SearchResponse(
+        [{name: _field_text(item, paths) for name, paths in fields.items()} for item in rows if isinstance(item, dict)],
+        status_code,
+    )
+
+
 async def search_request(
     *, url: str, method: Literal['GET', 'POST'], api_key: str,
     headers: Dict[str, str], params: Dict[str, Any], body: Dict[str, Any],
@@ -196,10 +208,4 @@ async def search_request(
         document = response.json()
     except ValueError as exc:
         raise SearchRequestError(f'返回内容不是 JSON；响应开头：{preview}', status) from exc
-    rows = value_at_path(document, results_path)
-    if not isinstance(rows, list):
-        raise SearchRequestError(f'返回内容里找不到结果列表 {results_path}；响应开头：{preview}', status)
-    return SearchResponse(
-        [{name: _field_text(item, paths) for name, paths in fields.items()} for item in rows if isinstance(item, dict)],
-        status,
-    )
+    return map_results(document, results_path=results_path, fields=fields, preview=preview, status_code=status)

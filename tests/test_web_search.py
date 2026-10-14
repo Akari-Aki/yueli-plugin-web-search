@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from pytest_asyncio import fixture as async_fixture
 from structlog.testing import capture_logs
+from types import SimpleNamespace
 from typing import Any, Dict
 
 import asyncio
@@ -38,7 +39,8 @@ def loaded(tmp_path):
     for name in ('_manifest.json', 'plugin.py', 'request.py'):
         shutil.copyfile(ROOT / name, directory / name)
     registry = PluginRegistry(context_factory=lambda plugin_id, path: PluginContext(plugin_id, path, tmp_path / 'data', Config()))
-    registry.discover([tmp_path])
+    # 新宿主显式标注插件来源；旧宿主仍接收单纯路径，不改变两套宿主的生产代码。
+    registry.discover([(tmp_path, False)] if hasattr(PluginContext, 'mcp') else [tmp_path])
     plugins = registry.tool_plugins()
     assert len(plugins) == 1
     instance = plugins[0]
@@ -97,6 +99,42 @@ async def execute(plugin, query='公开话题', arguments=None):
     return await executor.execute(ToolInvocation(tool_name=spec.name, arguments={'query': query} if arguments is None else arguments), context)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['text', 'structured', 'tool_error', 'unavailable', 'non_json'])
+async def test_star22_mcp_uses_common_observation_and_reports_errors(loaded, monkeypatch, case):
+    """MCP 接口仅用桩件；旧宿主缺少入口时跳过，不触碰真实服务。"""
+    if not hasattr(PluginContext, 'mcp'):
+        pytest.skip('旧宿主没有 ctx.mcp，HTTP 方式仍照常验收')
+    from src.plugin_system import McpUnavailableError
+    plugin = configure(loaded, transport='mcp', mcp_server='bailian', mcp_tool='search_pro',
+        arguments={'query': '{query}', 'count': '{count}'}, results_path='pages',
+        fields={'title': 'title', 'snippet': 'snippet', 'url': 'url', 'site': 'hostname'})
+    document = {'pages': [{'title': '桩件标题', 'snippet': '桩件摘要', 'url': 'https://example.test/result', 'hostname': '示例站点'}]}
+    calls = []
+    async def call_tool(server, tool, arguments):
+        calls.append((server, tool, arguments))
+        if case == 'unavailable':
+            raise McpUnavailableError('服务未连上')
+        return SimpleNamespace(is_error=case == 'tool_error', structured=document if case == 'structured' else None,
+            text='工具内部错误' if case == 'tool_error' else '不是 JSON' if case == 'non_json' else json.dumps(document, ensure_ascii=False))
+    monkeypatch.setattr(PluginContext, 'mcp', property(lambda _context: SimpleNamespace(call_tool=call_tool)))
+    await plugin.on_load()
+    result = await execute(plugin, '话题')
+    assert calls == [('bailian', 'search_pro', {'query': '话题', 'count': 5})]
+    assert plugin._requests_today == 1
+    if case in ('text', 'structured'):
+        assert result.success, result.error_message
+        plugin._cache.clear()
+        configure(loaded, transport='http', url=URL)
+        transport(plugin, lambda _request: httpx.Response(200, json=document))
+        await plugin.on_load()
+        http_result = await execute(plugin, '话题')
+        assert http_result.success and result.observation == http_result.observation
+    else:
+        reasons = {'tool_error': '工具内部错误', 'unavailable': '服务未连上', 'non_json': '返回内容不是 JSON；响应开头：不是 JSON'}
+        assert not result.success and result.error_message == '联网搜索失败：' + reasons[case]
+
+
 def transport(plugin, handler=None):
     """保留完整请求供断言，响应一律由 MockTransport 提供。"""
     requests = []
@@ -135,9 +173,9 @@ async def test_star5_real_discovery_registration_and_config_roundtrip(loaded):
     assert ensure_plugin_config(directory, plugin.config_model).model_dump() == defaults.model_dump()
     assert tomllib.loads((directory / 'config.toml').read_text(encoding='utf-8'))['plugin'] == {
         'enabled': True, 'url': '', 'method': 'POST', 'api_key': '', 'headers': {}, 'params': {}, 'body': {},
-        'results_path': '', 'fields': {}, 'daily_limit': 50,
+        'results_path': '', 'fields': {}, 'daily_limit': 50, 'transport': 'http', 'mcp_server': '', 'mcp_tool': '', 'arguments': {},
     }
-    assert plugin.manifest.version == '0.1.0'
+    assert plugin.manifest.version == '0.2.0'
 
 
 @pytest.mark.parametrize(('changes', 'reason'), [
@@ -469,14 +507,29 @@ EXAMPLES = [
 ]
 
 
-@pytest.mark.parametrize('index', range(5))
+@pytest.mark.parametrize('index', range(6))
 @pytest.mark.asyncio
-async def test_star14_readme_blocks_load_through_host_and_match_response_fixture(loaded, index):
+async def test_star14_readme_blocks_load_through_host_and_match_response_fixture(loaded, index, monkeypatch):
     blocks = re.findall(r'```toml\n(.*?)\n```', (ROOT / 'README.md').read_text(encoding='utf-8'), re.S)
-    assert len(blocks) == 5
-    plugin = configure(loaded, **tomllib.loads(blocks[index]))
+    examples = [tomllib.loads(block) for block in blocks if 'mcp' not in tomllib.loads(block)]
+    assert len(examples) == 6
+    if index == 5 and not hasattr(PluginContext, 'mcp'):
+        pytest.skip('旧宿主没有 ctx.mcp，MCP 示例由新宿主验收')
+    plugin = configure(loaded, **examples[index])
     await plugin.on_load()
     assert plugin.stream_capabilities(7) == frozenset({'web_search'})
+    if index == 5:
+        calls = []
+        async def call_tool(server, tool, arguments):
+            calls.append((server, tool, arguments))
+            return SimpleNamespace(is_error=False, structured=None, text=json.dumps({'pages': [{
+                'title': '桩件标题', 'snippet': '桩件摘要', 'url': 'https://example.test/result', 'hostname': '示例站点'}]}))
+        monkeypatch.setattr(PluginContext, 'mcp', property(lambda _context: SimpleNamespace(call_tool=call_tool)))
+        result = await execute(plugin, '话题')
+        assert result.success, result.error_message
+        assert calls == [('bailian', 'search_pro', {'query': '话题'})]
+        assert all(value in result.observation for value in ['桩件标题', '桩件摘要', 'https://example.test/result'])
+        return
     if plugin.config.api_key:
         configure(loaded, api_key='fake-example-key')
         await plugin.on_load()
