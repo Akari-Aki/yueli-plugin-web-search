@@ -13,12 +13,6 @@ sys.path.insert(0, str(YUELI_ROOT))
 
 
 @pytest.fixture(autouse=True)
-def released_host_version(monkeypatch):
-    """清单面向 0.2.0；宿主本次尚未发版，用例替换版本比较实际读取的名字。"""
-    monkeypatch.setattr('src.plugin_system.manifest.APP_VERSION', '0.2.0')
-
-
-@pytest.fixture(autouse=True)
 def forbid_network(monkeypatch):
     """任何遗漏 MockTransport 的请求立即失败。"""
     async def forbidden(*_args, **_kwargs):
