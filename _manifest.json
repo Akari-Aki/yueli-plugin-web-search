@@ -5,7 +5,7 @@
   "name": "联网搜索",
   "version": "0.2.5",
   "description": "按部署者配置的 HTTP JSON 接口或宿主 MCP 工具搜索公开信息，结果作为外部观察回灌",
-  "author": { "name": "YueLi-and-Me", "url": "https://github.com/YueLi-and-Me" },
+  "author": { "name": "Akari-Aki", "url": "https://github.com/Akari-Aki" },
   "license": "AGPL-3.0-only",
   "host_application": { "min_version": "0.2.0", "max_version": "0.2.5" }
 }
