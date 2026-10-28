@@ -175,14 +175,14 @@ async def test_star5_real_discovery_registration_and_config_roundtrip(loaded):
         'enabled': True, 'url': '', 'method': 'POST', 'api_key': '', 'headers': {}, 'params': {}, 'body': {},
         'results_path': '', 'fields': {}, 'daily_limit': 50, 'transport': 'http', 'mcp_server': '', 'mcp_tool': '', 'arguments': {},
     }
-    assert plugin.manifest.version == '0.2.5'
+    assert plugin.manifest.version == '0.3.0'
 
 
 @pytest.mark.parametrize(('host', 'decision'), [
-    ('0.1.5', '不兼容'), ('0.2.0', '正常'), ('0.2.5', '正常'), ('0.2.6', '兼容模式'), ('0.3.0', '不兼容'),
+    ('0.1.5', '不兼容'), ('0.2.0', '正常'), ('0.2.5', '正常'), ('0.3.0', '正常'), ('0.3.1', '兼容模式'),
 ])
 def test_manifest_host_range_matches_supported_versions(monkeypatch, host, decision):
-    """清单区间覆盖 0.2.0～0.2.5：区间内正常加载，同一次版本的后续补丁走兼容模式。"""
+    """清单区间覆盖 0.2.0～0.3.0：区间内正常加载，更新的主程序按宿主规则走兼容模式。"""
     from src.plugin_system.manifest import check_host_compatibility, load_manifest
 
     monkeypatch.setattr('src.plugin_system.manifest.APP_VERSION', host)

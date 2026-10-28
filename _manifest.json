@@ -3,9 +3,9 @@
   "id": "yueli.web-search",
   "plugin_type": "tool",
   "name": "联网搜索",
-  "version": "0.2.5",
-  "description": "按部署者配置的 HTTP JSON 接口或宿主 MCP 工具搜索公开信息，结果作为外部观察回灌",
+  "version": "0.3.0",
+  "description": "通用联网搜索，需要自己填写搜索服务的接口地址、请求格式和结果字段，也可接 MCP 搜索工具；只填密钥不会启用。只想填 DeepSeek 密钥直接用，请装「DeepSeek 联网搜索」",
   "author": { "name": "Akari-Aki", "url": "https://github.com/Akari-Aki" },
   "license": "AGPL-3.0-only",
-  "host_application": { "min_version": "0.2.0", "max_version": "0.2.5" }
+  "host_application": { "min_version": "0.2.0", "max_version": "0.3.0" }
 }
